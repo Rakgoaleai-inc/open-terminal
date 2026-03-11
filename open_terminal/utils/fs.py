@@ -63,21 +63,27 @@ class UserFS:
     # Path validation
     # ------------------------------------------------------------------
 
-    def _check_path(self, path: str) -> None:
-        """Reject paths inside another user's home directory."""
+    def is_path_allowed(self, path: str) -> bool:
+        """Return *False* if *path* is inside another user's home directory."""
         if not self.username:
-            return
+            return True
         resolved = os.path.abspath(path)
         if not resolved.startswith("/home/"):
-            return
+            return True
         parts = resolved.split("/")  # ['', 'home', '<user>', ...]
         if len(parts) >= 3:
             target_user_dir = parts[2]
             own_home_name = os.path.basename(self.home)
             if target_user_dir != own_home_name:
-                raise PermissionError(
-                    f"Access denied: {resolved} belongs to another user"
-                )
+                return False
+        return True
+
+    def _check_path(self, path: str) -> None:
+        """Reject paths inside another user's home directory."""
+        if not self.is_path_allowed(path):
+            raise PermissionError(
+                f"Access denied: {os.path.abspath(path)} belongs to another user"
+            )
 
     async def _chown(self, path: str) -> None:
         """Fix ownership of *path* to the provisioned user."""
@@ -136,6 +142,8 @@ class UserFS:
             entries = []
             for name in sorted(os.listdir(path)):
                 full = os.path.join(path, name)
+                if not self.is_path_allowed(full):
+                    continue
                 try:
                     s = os.stat(full)
                     entries.append({
@@ -150,9 +158,28 @@ class UserFS:
         return await asyncio.to_thread(_list_sync)
 
     async def walk(self, path: str) -> list[tuple[str, list[str], list[str]]]:
-        """Walk directory tree. Returns list of (dirpath, dirnames, filenames)."""
+        """Walk directory tree. Returns list of (dirpath, dirnames, filenames).
+
+        In multi-user mode, directories belonging to other users are pruned
+        so their contents are never yielded.
+        """
         self._check_path(path)
-        return await asyncio.to_thread(lambda: list(os.walk(path)))
+        def _walk_filtered():
+            result = []
+            for dirpath, dirnames, filenames in os.walk(path):
+                # Prune directories belonging to other users (in-place
+                # modification prevents os.walk from descending into them).
+                dirnames[:] = [
+                    d for d in dirnames
+                    if self.is_path_allowed(os.path.join(dirpath, d))
+                ]
+                filenames = [
+                    f for f in filenames
+                    if self.is_path_allowed(os.path.join(dirpath, f))
+                ]
+                result.append((dirpath, dirnames, filenames))
+            return result
+        return await asyncio.to_thread(_walk_filtered)
 
     # ------------------------------------------------------------------
     # Write operations (native Python + chown for correct ownership)

@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.11.8] - 2026-03-11
+
+### Fixed
+
+- 🔒 **Multi-user search isolation** — `glob_search`, `grep_search`, `listdir`, and `walk` now filter out entries belonging to other users' home directories during traversal. Previously, searching a parent directory like `/home` would expose all users' files. Added `is_path_allowed()` to `UserFS` for per-entry validation during `os.walk`. ([#46](https://github.com/open-webui/open-terminal/issues/46))
+
 ## [0.11.7] - 2026-03-11
 
 ### Fixed

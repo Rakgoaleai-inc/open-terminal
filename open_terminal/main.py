@@ -783,13 +783,21 @@ async def grep_search(
         if os.path.isfile(target):
             _search_file(target)
         else:
-            for dirpath, _, filenames in os.walk(target):
+            for dirpath, dirnames, filenames in os.walk(target):
+                # Prune directories belonging to other users.
+                dirnames[:] = [
+                    d for d in dirnames
+                    if fs.is_path_allowed(os.path.join(dirpath, d))
+                ]
                 if truncated:
                     break
                 for filename in sorted(filenames):
                     if not _matches_include(filename):
                         continue
-                    _search_file(os.path.join(dirpath, filename))
+                    full = os.path.join(dirpath, filename)
+                    if not fs.is_path_allowed(full):
+                        continue
+                    _search_file(full)
 
         return matches, truncated
 
@@ -840,6 +848,12 @@ async def glob_search(
         for dirpath, dirnames, filenames in os.walk(target):
             if truncated:
                 break
+
+            # Prune directories belonging to other users.
+            dirnames[:] = [
+                d for d in dirnames
+                if fs.is_path_allowed(os.path.join(dirpath, d))
+            ]
 
             entries = []
             if type in ("any", "directory"):
