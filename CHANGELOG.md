@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.11.10] - 2026-03-11
+
+### Fixed
+
+- 🧟 **Zombie process cleanup** — process runner `kill()` methods now use `os.killpg()` to signal the entire process group instead of just the direct child PID. Background processes started inside terminals or `/execute` sessions (e.g. `sleep 100 &`) are now properly terminated on cleanup. `_cleanup_session()` always calls `process.wait()` after force-killing to prevent zombie entries in the process table.
+- 🐳 **Docker PID 1 reaping** — added `tini` as the container's init process (`ENTRYPOINT ["/usr/bin/tini", "--", ...]`). Python/uvicorn no longer runs as PID 1, so orphaned grandchild processes are automatically reaped instead of accumulating as zombies.
+
 ## [0.11.9] - 2026-03-11
 
 ### Added

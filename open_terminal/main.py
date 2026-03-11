@@ -1246,7 +1246,13 @@ if ENABLE_TERMINAL:
 
 
     def _cleanup_session(session_id: str):
-        """Clean up a terminal session's resources."""
+        """Clean up a terminal session's resources.
+
+        For PTY sessions the shell is spawned with ``start_new_session=True``,
+        giving it a dedicated process group.  We signal the *entire* group so
+        that background jobs started inside the terminal (e.g. ``sleep 999 &``)
+        are also reaped, and always call ``process.wait()`` to avoid zombies.
+        """
         session = _terminal_sessions.pop(session_id, None)
         if session is None:
             return
@@ -1258,13 +1264,23 @@ if ENABLE_TERMINAL:
                 os.close(session["master_fd"])
             except OSError:
                 pass
+
             process = session["process"]
             if process.poll() is None:
-                process.terminate()
+                # Signal the whole process group first (graceful).
                 try:
-                    process.wait(timeout=2)
+                    os.killpg(process.pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                try:
+                    process.wait(timeout=3)
                 except subprocess.TimeoutExpired:
-                    process.kill()
+                    # Forceful kill of the entire group.
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    process.wait()
 
         elif backend == "winpty":
             pty_proc = session["pty_process"]

@@ -109,11 +109,21 @@ class PtyRunner(ProcessRunner):
     def write_input(self, data: bytes) -> None:
         os.write(self._master_fd, data)
 
+    def _signal_group(self, sig: int) -> None:
+        """Send *sig* to the child's entire process group.
+
+        Falls back to signalling just the leader if the group is already gone.
+        """
+        try:
+            os.killpg(self._process.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            try:
+                self._process.send_signal(sig)
+            except ProcessLookupError:
+                pass
+
     def kill(self, force: bool = False) -> None:
-        if force:
-            self._process.kill()
-        else:
-            self._process.send_signal(signal.SIGTERM)
+        self._signal_group(signal.SIGKILL if force else signal.SIGTERM)
 
     async def wait(self) -> int:
         return await asyncio.to_thread(self._process.wait)
@@ -176,10 +186,12 @@ class PipeRunner(ProcessRunner):
         await self._process.stdin.drain()
 
     def kill(self, force: bool = False) -> None:
-        if force:
-            self._process.kill()
-        else:
-            self._process.send_signal(signal.SIGTERM)
+        sig = signal.SIGKILL if force else signal.SIGTERM
+        try:
+            os.killpg(self._process.pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            # No dedicated process group — fall back to the child directly.
+            self._process.send_signal(sig)
 
     async def wait(self) -> int:
         await self._process.wait()
