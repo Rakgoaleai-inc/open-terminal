@@ -24,6 +24,29 @@ That's it — you're up and running at `http://localhost:8000`.
 > [!TIP]
 > If you don't set an API key, one is generated automatically. Grab it with `docker logs open-terminal`.
 
+#### Image Variants
+
+| Tag | Base | What's included | Size |
+|---|---|---|---|
+| `latest` | Debian | Full toolkit — Python, Node.js, git, Docker CLI, ffmpeg, data science libs, and more | ~2 GB |
+| `slim` | Debian slim | Terminal API + git, curl, jq. No Node.js, no Docker CLI, no sudo. | ~200 MB |
+| `alpine` | Alpine | Same as slim but on Alpine Linux with musl libc. Smallest possible image. | ~100 MB |
+
+```bash
+# Slim — minimal Debian-based image
+docker run -d --name open-terminal -p 8000:8000 \
+  -e OPEN_TERMINAL_API_KEY=your-secret-key \
+  ghcr.io/open-webui/open-terminal:slim
+
+# Alpine — smallest image
+docker run -d --name open-terminal -p 8000:8000 \
+  -e OPEN_TERMINAL_API_KEY=your-secret-key \
+  ghcr.io/open-webui/open-terminal:alpine
+```
+
+> [!NOTE]
+> The slim and Alpine images do **not** support `OPEN_TERMINAL_PACKAGES` or `OPEN_TERMINAL_PIP_PACKAGES` runtime installs. To add packages, build a custom image based on the slim/Alpine Dockerfile.
+
 #### Updating
 
 ```bash
