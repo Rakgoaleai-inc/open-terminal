@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.11.15] - 2026-03-13
+
+### Changed
+
+- 🖥️ **Redesigned startup output** — the CLI now displays Local and Network URLs, the generated API key, and a bind warning in a clean, modern key-value layout with color-coded labels. Network URL auto-detects your LAN IP when binding to `0.0.0.0`.
+- 🔒 **Bind warning** — a yellow warning is printed at startup when binding to `0.0.0.0`, nudging bare-metal users to restrict access with `--host 127.0.0.1`.
+
 ## [0.11.14] - 2026-03-13
 
 ### Fixed

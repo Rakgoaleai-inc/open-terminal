@@ -92,11 +92,31 @@ def run(
     os.environ["OPEN_TERMINAL_CORS_ALLOWED_ORIGINS"] = cors_allowed_origins
 
     click.echo(BANNER)
-    if generated:
-        click.echo("=" * 60)
-        click.echo(f"  API Key: {api_key}")
-        click.echo("=" * 60)
+
+    # -- Startup info block --
+    local_url = f"http://{'localhost' if host in ('0.0.0.0', '127.0.0.1') else host}:{port}"
+
+    click.echo(f"  {click.style('Local:', bold=True)}    {click.style(local_url, fg='cyan')}")
+    if host == "0.0.0.0":
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            network_ip = s.getsockname()[0]
+            s.close()
+            click.echo(f"  {click.style('Network:', bold=True)}  http://{network_ip}:{port}")
+        except Exception:
+            pass
     click.echo()
+
+    if generated:
+        click.echo(f"  {click.style('API Key:', bold=True)}  {api_key}")
+        click.echo()
+
+    if host == "0.0.0.0":
+        click.echo(click.style("  Warning: Listening on all network interfaces.", fg="yellow"))
+        click.echo(click.style("  Use --host 127.0.0.1 to restrict to this machine.", dim=True))
+        click.echo()
 
     from open_terminal.env import UVICORN_LOOP
     uvicorn.run("open_terminal.main:app", host=host, port=port, loop=UVICORN_LOOP)
