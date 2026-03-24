@@ -922,6 +922,73 @@ async def upload_file(
     return {"path": path, "size": len(content)}
 
 
+class ArchiveRequest(BaseModel):
+    paths: list[str] = Field(
+        ...,
+        description="List of file or directory paths to include in the ZIP archive.",
+    )
+
+
+@app.post(
+    "/files/archive",
+    include_in_schema=False,
+    dependencies=[Depends(verify_api_key)],
+)
+async def archive_paths(
+    request: ArchiveRequest,
+    fs: UserFS = Depends(get_filesystem),
+):
+    """Bundle files and/or directories into a single ZIP archive."""
+    import io
+    import zipfile
+
+    if not request.paths:
+        raise HTTPException(status_code=400, detail="No paths provided")
+
+    resolved = []
+    for p in request.paths:
+        target = fs.resolve_path(p)
+        if not await fs.exists(target):
+            raise HTTPException(status_code=404, detail=f"Path not found: {p}")
+        resolved.append(target)
+
+    # Derive a meaningful archive name from the input paths.
+    if len(resolved) == 1:
+        archive_name = os.path.basename(resolved[0].rstrip("/\\")) or "archive"
+    else:
+        archive_name = "download"
+
+    def _build_zip() -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for target in resolved:
+                if os.path.isfile(target):
+                    zf.write(target, os.path.basename(target))
+                elif os.path.isdir(target):
+                    dirname = os.path.basename(target.rstrip("/\\")) or "dir"
+                    for dirpath, dirnames, filenames in os.walk(target):
+                        dirnames[:] = [
+                            d for d in dirnames
+                            if fs.is_path_allowed(os.path.join(dirpath, d))
+                        ]
+                        for fname in filenames:
+                            full = os.path.join(dirpath, fname)
+                            if not fs.is_path_allowed(full):
+                                continue
+                            arcname = os.path.join(
+                                dirname, os.path.relpath(full, target)
+                            )
+                            zf.write(full, arcname)
+        return buf.getvalue()
+
+    data = await asyncio.to_thread(_build_zip)
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{archive_name}.zip"',
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

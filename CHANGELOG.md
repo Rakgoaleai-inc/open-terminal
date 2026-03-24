@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.11.28] - 2026-03-24
+
+### Added
+
+- 📦 **Compressed directory download** (`POST /files/archive`) — bundle one or more files and directories into a ZIP archive for download. Cross-platform compatible (Windows, macOS, Linux). Multi-user access control enforced.
+
 ## [0.11.27] - 2026-03-22
 
 ### Added
