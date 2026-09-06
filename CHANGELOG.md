@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.12.4] - 2026-09-06
+
+### Added
+
+- Assistants can now read recent output and send text to your connected terminal in the current chat, including answering prompts from a running program. Requires Open WebUI 0.11.4.
+
+### Fixed
+
+- Terminal and background command lists now show only entries belonging to the current user and chat. Other users and chats cannot read their output, send them input, or stop them through these controls.
+- Opening another terminal in the same chat no longer replaces the first terminal's saved entry.
+- A second connection to an already connected terminal is now rejected, preventing the two connections from splitting its output.
+- Sending a large amount of text to a busy terminal no longer drops the unwritten portion. Text sent at the same time is handled in order without mixing the requests together.
+- Stopped background commands remain available for five minutes so you can check their output and exit code. They stay marked as killed instead of changing to done.
+- Checking for new command output after reading only the latest lines no longer repeats older output. Checks also keep their place when an oversized log has its oldest output removed, and report when output was discarded.
+- Reading command output while an oversized log is being shortened no longer returns a partially rewritten log. Commands are marked done only after their final output has been saved, including when the log was shortened during the run.
+
 ## [0.12.3] - 2026-08-27
 
 ### Added
