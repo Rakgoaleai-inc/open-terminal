@@ -343,6 +343,8 @@ class BackgroundProcess:
     log_task: Optional[asyncio.Task] = field(default=None, repr=False)
     finished_at: Optional[float] = field(default=None, repr=False)
     log_path: Optional[str] = field(default=None, repr=False)
+    user_id: str = ""
+    session_id: str = ""
 
 
 _processes: dict[str, BackgroundProcess] = {}
@@ -414,10 +416,13 @@ def _cleanup_expired():
                 pass
 
 
-def _get_process(process_id: str) -> BackgroundProcess:
+def _get_process(process_id: str, request: Request) -> BackgroundProcess:
     _cleanup_expired()
     background_process = _processes.get(process_id)
-    if not background_process:
+    if not background_process or (
+        background_process.user_id != request.headers.get("x-user-id", "")
+        or background_process.session_id != request.headers.get("x-session-id", "")
+    ):
         raise HTTPException(status_code=404, detail="Process not found")
     return background_process
 
@@ -1536,13 +1541,13 @@ async def archive_paths(
     "/execute",
     operation_id="list_processes",
     summary="List running commands",
-    description="Returns a list of all tracked background processes, including running, done, and killed.",
+    description="Returns tracked processes for the current user and chat, including running, done, and killed.",
     dependencies=[Depends(verify_api_key)],
     responses={
         401: {"description": "Invalid or missing API key."},
     },
 )
-async def list_processes():
+async def list_processes(http_request: Request):
     _cleanup_expired()
     return [
         {
@@ -1553,6 +1558,8 @@ async def list_processes():
             "log_path": background_process.log_path,
         }
         for background_process in _processes.values()
+        if background_process.user_id == http_request.headers.get("x-user-id", "")
+        and background_process.session_id == http_request.headers.get("x-session-id", "")
     ]
 
 
@@ -1594,7 +1601,9 @@ async def execute(
     process_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     log_path = os.path.join(LOG_DIR, "processes", f"{process_id}.jsonl")
     background_process = BackgroundProcess(
-        id=process_id, command=request.command, runner=runner, log_path=log_path
+        id=process_id, command=request.command, runner=runner, log_path=log_path,
+        user_id=http_request.headers.get("x-user-id", ""),
+        session_id=http_request.headers.get("x-session-id", ""),
     )
     background_process.log_task = asyncio.create_task(log_process(background_process))
     _processes[process_id] = background_process
@@ -1629,7 +1638,7 @@ async def execute(
     "/execute/{process_id}/status",
     operation_id="get_process_status",
     summary="Get command status and output",
-    description="Returns new output since the last poll, process status, and exit code. Output is drained on read to keep memory bounded.",
+    description="Returns new output since the given offset, process status, and exit code. Reads do not consume output; each reader keeps its own offset.",
     dependencies=[Depends(verify_api_key)],
     responses={
         404: {"description": "Process not found."},
@@ -1638,6 +1647,7 @@ async def execute(
 )
 async def get_status(
     process_id: str,
+    http_request: Request,
     wait: Optional[float] = Query(
         None,
         description="Seconds to wait for the process to finish before returning. Returns early if the process exits. Null to return immediately.",
@@ -1655,7 +1665,7 @@ async def get_status(
         ge=1,
     ),
 ):
-    background_process = _get_process(process_id)
+    background_process = _get_process(process_id, http_request)
 
     if wait is None and EXECUTE_TIMEOUT:
         wait = EXECUTE_TIMEOUT
@@ -1695,8 +1705,8 @@ async def get_status(
         401: {"description": "Invalid or missing API key."},
     },
 )
-async def send_input(process_id: str, body: InputRequest):
-    background_process = _get_process(process_id)
+async def send_input(process_id: str, body: InputRequest, http_request: Request):
+    background_process = _get_process(process_id, http_request)
     if background_process.status != "running":
         raise HTTPException(status_code=400, detail="Process has already exited")
 
@@ -1727,16 +1737,18 @@ async def send_input(process_id: str, body: InputRequest):
 )
 async def kill_process(
     process_id: str,
+    http_request: Request,
     force: bool = Query(False, description="Send SIGKILL instead of SIGTERM."),
 ):
-    background_process = _get_process(process_id)
+    background_process = _get_process(process_id, http_request)
     if background_process.status == "running":
+        background_process.status = "killed"
         background_process.runner.kill(force=force)
         exit_code = await background_process.runner.wait()
         background_process.runner.close()
         background_process.status = "killed"
         background_process.exit_code = exit_code
-    del _processes[process_id]
+    background_process.finished_at = time.time()
     return {"status": "killed"}
 
 
@@ -1976,8 +1988,8 @@ if ENABLE_TERMINAL:
                 fs = get_filesystem(request)
 
                 # Use per-session cwd if available, else fall back to home
-                session_id = request.headers.get("x-session-id", session_id)
-                session_cwd = _get_session_cwd(session_id, fs) if session_id else None
+                chat_id = request.headers.get("x-session-id")
+                session_cwd = _get_session_cwd(chat_id, fs) if chat_id else None
 
                 if fs.username:
                     shell_cmd = [
@@ -2037,6 +2049,13 @@ if ENABLE_TERMINAL:
             }
 
         session = _terminal_sessions[session_id]
+        session.update(
+            user_id=request.headers.get("x-user-id", ""),
+            chat_id=request.headers.get("x-session-id", ""),
+            output=bytearray(),
+            connected=False,
+            input_lock=asyncio.Lock(),
+        )
         return {
             "id": session_id,
             "created_at": session["created_at"],
@@ -2052,12 +2071,62 @@ if ENABLE_TERMINAL:
             return session["pty_process"].isalive()
 
 
+    def _owns_terminal(session: dict, request) -> bool:
+        return (
+            session["user_id"] == request.headers.get("x-user-id", "")
+            and session["chat_id"] == request.headers.get("x-session-id", "")
+        )
+
+
+    def _user_terminal(request: Request) -> dict:
+        for session in reversed(_terminal_sessions.values()):
+            if _owns_terminal(session, request) and session["connected"] and _session_is_alive(session):
+                return session
+        raise HTTPException(status_code=404, detail="No connected user shell")
+
+
+    async def _write_terminal(session: dict, data: bytes):
+        async with session["input_lock"]:
+            if session["backend"] == "pty":
+                while data:
+                    try:
+                        written = os.write(session["master_fd"], data)
+                        data = data[written:]
+                    except BlockingIOError:
+                        await asyncio.sleep(0.01)
+            else:
+                await asyncio.to_thread(session["pty_process"].write, data.decode(errors="replace"))
+
+
+    @app.get("/api/terminals/user/output", operation_id="read_user_terminal", dependencies=[Depends(verify_api_key)])
+    async def read_user_terminal(request: Request):
+        """Read recent output from the user's connected shell. Inspect before sending input:
+        a foreground program may already be running. Does not create a shell."""
+        session = _user_terminal(request)
+        return {"output": bytes(session["output"]).decode(errors="replace")}
+
+
+    @app.post("/api/terminals/user/input", operation_id="send_user_terminal_input", dependencies=[Depends(verify_api_key)])
+    async def send_user_terminal_input(request: Request, body: InputRequest):
+        """Send literal text to the user's connected shell or its foreground program.
+        Include actual newlines to submit input. Read the shell first. Sending input
+        does not wait for command completion and does not create a shell."""
+        session = _user_terminal(request)
+        try:
+            await _write_terminal(session, body.input.encode())
+        except (OSError, EOFError):
+            raise HTTPException(status_code=409, detail="User shell has disconnected")
+        return {"status": "ok"}
+
+
     @app.get("/api/terminals", dependencies=[Depends(verify_api_key)], include_in_schema=False)
     async def list_terminals(request: Request):
         """List active terminal sessions."""
         result = []
         to_remove = []
         for sid, session in _terminal_sessions.items():
+            if not _owns_terminal(session, request):
+                continue
             if not _session_is_alive(session):
                 to_remove.append(sid)
                 continue
@@ -2075,7 +2144,7 @@ if ENABLE_TERMINAL:
     async def get_terminal(session_id: str, request: Request):
         """Get info about a terminal session."""
         session = _terminal_sessions.get(session_id)
-        if session is None:
+        if session is None or not _owns_terminal(session, request):
             return JSONResponse({"error": "Session not found"}, status_code=404)
         if not _session_is_alive(session):
             _cleanup_session(session_id)
@@ -2090,7 +2159,7 @@ if ENABLE_TERMINAL:
     @app.delete("/api/terminals/{session_id}", dependencies=[Depends(verify_api_key)], include_in_schema=False)
     async def delete_terminal(session_id: str, request: Request):
         """Kill and remove a terminal session."""
-        if session_id not in _terminal_sessions:
+        if session_id not in _terminal_sessions or not _owns_terminal(_terminal_sessions[session_id], request):
             return JSONResponse({"error": "Session not found"}, status_code=404)
         _cleanup_session(session_id)
         return {"status": "deleted"}
@@ -2126,18 +2195,27 @@ if ENABLE_TERMINAL:
         await ws.accept()
 
         # First-message authentication
-        if API_KEY:
-            try:
-                msg = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
-                payload = json.loads(msg)
-                if payload.get("type") != "auth" or not hmac.compare_digest(payload.get("token", ""), API_KEY):
-                    await ws.close(code=4001, reason="Invalid API key")
-                    return
-            except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
-                await ws.close(code=4001, reason="Auth timeout or invalid payload")
+        try:
+            msg = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
+            payload = json.loads(msg)
+            if payload.get("type") != "auth" or (API_KEY and not hmac.compare_digest(payload.get("token", ""), API_KEY)):
+                await ws.close(code=4001, reason="Invalid API key")
                 return
+        except (asyncio.TimeoutError, ValueError, AttributeError, WebSocketDisconnect):
+            await ws.close(code=4001, reason="Auth timeout or invalid payload")
+            return
+        if (
+            session["user_id"] != ws.headers.get("x-user-id", "")
+            or session["chat_id"] != ws.headers.get("x-session-id", payload.get("chat_id", ""))
+        ):
+            await ws.close(code=4004, reason="Session not found")
+            return
 
         backend = session["backend"]
+        if session["connected"]:
+            await ws.close(code=4009, reason="Session already connected")
+            return
+        session["connected"] = True
         loop = asyncio.get_event_loop()
         stop_event = asyncio.Event()
 
@@ -2160,9 +2238,6 @@ if ENABLE_TERMINAL:
 
             def _check_alive():
                 return process.poll() is None
-
-            def _write_data(data: bytes):
-                os.write(master_fd, data)
 
             def _do_resize(rows: int, cols: int):
                 fcntl.ioctl(
@@ -2187,9 +2262,6 @@ if ENABLE_TERMINAL:
             def _check_alive():
                 return pty_proc.isalive()
 
-            def _write_data(data: bytes):
-                pty_proc.write(data.decode(errors="replace"))
-
             def _do_resize(rows: int, cols: int):
                 pty_proc.setwinsize(rows, cols)
 
@@ -2207,6 +2279,8 @@ if ENABLE_TERMINAL:
                             break
                         continue
                     try:
+                        session["output"].extend(data)
+                        del session["output"][:-65536]
                         await ws.send_bytes(data)
                     except Exception:
                         break
@@ -2221,7 +2295,7 @@ if ENABLE_TERMINAL:
                 if msg["type"] == "websocket.disconnect":
                     break
                 elif "bytes" in msg and msg["bytes"]:
-                    await loop.run_in_executor(None, _write_data, msg["bytes"])
+                    await _write_terminal(session, msg["bytes"])
                 elif "text" in msg and msg["text"]:
                     try:
                         payload = json.loads(msg["text"])

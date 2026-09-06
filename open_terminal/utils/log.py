@@ -4,9 +4,11 @@ Handles writing, reading, and capping JSONL log files for background
 processes.  Extracted from ``main.py`` to keep the route module focused.
 """
 
+import asyncio
 import json
 import os
 import time
+from collections import deque
 from typing import Optional
 
 import aiofiles
@@ -34,6 +36,7 @@ class BoundedLogWriter:
     __slots__ = (
         "_file", "_log_path", "_bytes_written", "rotated",
         "_flush_interval", "_flush_buffer", "_unflushed", "_last_flush",
+        "_lock",
     )
 
     def __init__(self, file, log_path: str, *, flush_interval: float = 0, flush_buffer: int = 0):
@@ -45,8 +48,13 @@ class BoundedLogWriter:
         self._flush_buffer = flush_buffer
         self._unflushed = 0
         self._last_flush = time.monotonic()
+        self._lock = asyncio.Lock()
 
     async def write(self, data: str) -> None:
+        async with self._lock:
+            await self._write(data)
+
+    async def _write(self, data: str) -> None:
         encoded_len = len(data.encode("utf-8", errors="replace"))
         if self._bytes_written + encoded_len > MAX_PROCESS_LOG_SIZE:
             await self._rotate()
@@ -85,67 +93,31 @@ class BoundedLogWriter:
             lines = await f.readlines()
 
         # Keep the newest half of output lines.
-        keep = lines[len(lines) // 2 :]
+        split = len(lines) // 2
+        keep = lines[split:]
+        offset = 0
+        for line in lines[:split]:
+            record = json.loads(line)
+            if record.get("type") == "log_rotated":
+                offset = record.get("offset", 0)
+            elif record.get("type") in ("stdout", "stderr", "output"):
+                offset += 1
 
-        async with aiofiles.open(self._log_path, "w", encoding="utf-8") as f:
+        # Replace atomically so readers see either complete generation.
+        temporary_path = self._log_path + ".rotating"
+        async with aiofiles.open(temporary_path, "w", encoding="utf-8") as f:
             await f.write(
-                json.dumps({"type": "log_rotated", "ts": time.time()}) + "\n"
+                json.dumps({"type": "log_rotated", "offset": offset, "ts": time.time()}) + "\n"
             )
             for line in keep:
                 await f.write(line)
+        await aiofiles.os.replace(temporary_path, self._log_path)
 
         # Reopen in append mode and reset byte counter.
         self._file = await aiofiles.open(self._log_path, "a", encoding="utf-8")
         self._bytes_written = sum(len(l.encode("utf-8", errors="replace")) for l in keep)
 
 
-async def tail_log(log_path: str, n: int) -> list[dict]:
-    """Read the last *n* output entries from a JSONL log without loading the whole file.
-
-    Uses a reverse-read strategy: read chunks from the end of the file
-    until enough newline-delimited records have been collected.
-    """
-    CHUNK = 8192
-    entries: list[dict] = []
-
-    async with aiofiles.open(log_path, "rb") as f:
-        await f.seek(0, 2)  # seek to end
-        remaining = await f.tell()
-        buffer = b""
-
-        while remaining > 0 and len(entries) < n:
-            read_size = min(CHUNK, remaining)
-            remaining -= read_size
-            await f.seek(remaining)
-            chunk = await f.read(read_size)
-            buffer = chunk + buffer
-            lines = buffer.split(b"\n")
-            # The first element may be a partial line — keep it for next iteration.
-            buffer = lines[0]
-            for raw_line in reversed(lines[1:]):
-                raw_line = raw_line.strip()
-                if not raw_line:
-                    continue
-                try:
-                    record = json.loads(raw_line)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-                if record.get("type") in ("stdout", "stderr", "output"):
-                    entries.append({"type": record["type"], "data": record["data"]})
-                    if len(entries) >= n:
-                        break
-
-        # Process any remaining buffer content.
-        if buffer.strip() and len(entries) < n:
-            try:
-                record = json.loads(buffer)
-                if record.get("type") in ("stdout", "stderr", "output"):
-                    entries.append({"type": record["type"], "data": record["data"]})
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                pass
-
-    entries.reverse()  # restore chronological order
-    return entries[-n:]
 
 
 async def log_process(background_process) -> None:
@@ -195,14 +167,9 @@ async def log_process(background_process) -> None:
         log_rotated = writer.rotated if writer else False
         exit_code = await background_process.runner.wait()
         background_process.exit_code = exit_code
-        background_process.status = "done"
-        background_process.finished_at = time.time()
         background_process.runner.close()
         if writer:
-            # Flush any buffered output before writing the end marker.
-            await writer.flush()
-        if log_file:
-            await log_file.write(
+            await writer.write(
                 json.dumps(
                     {
                         "type": "end",
@@ -213,7 +180,11 @@ async def log_process(background_process) -> None:
                 )
                 + "\n"
             )
-            await log_file.close()
+            await writer.flush()
+            await writer._file.close()
+        if background_process.status != "killed":
+            background_process.status = "done"
+        background_process.finished_at = time.time()
 
 
 async def read_log(
@@ -225,41 +196,30 @@ async def read_log(
 
     Returns ``(entries, next_offset, truncated)``.
 
-    When *tail* is specified and *offset* is 0, the file is read from the
-    end to avoid loading the entire file into memory — preventing the
-    memory spike that caused the OOM issue.
+    Offsets count output entries across rotations. Tail reads retain only
+    the requested entries in memory while still returning an absolute cursor.
     """
     entries: list[dict] = []
     if not log_path or not await aiofiles.os.path.isfile(log_path):
         return entries, 0, False
 
-    # --- Optimised tail-from-end path ---
-    if tail is not None and offset == 0:
-        tail_entries = await tail_log(log_path, tail)
-        truncated = len(tail_entries) == tail  # may have been more
-        return tail_entries, len(tail_entries), truncated
-
-    # --- Full scan path (bounded by offset) ---
-    async with aiofiles.open(log_path, encoding="utf-8") as f:
-        lines = await f.readlines()
-
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if record.get("type") in ("stdout", "stderr", "output"):
-            entries.append({"type": record["type"], "data": record["data"]})
-
-    total = len(entries)
-    entries = entries[offset:]
-
+    selected = deque(maxlen=tail)
+    total = 0
+    available = 0
     truncated = False
-    if tail is not None and len(entries) > tail:
-        entries = entries[-tail:]
-        truncated = True
+    async with aiofiles.open(log_path, encoding="utf-8") as f:
+        async for line in f:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("type") == "log_rotated":
+                total = record.get("offset", 0)
+                truncated = offset < total
+            elif record.get("type") in ("stdout", "stderr", "output"):
+                if total >= offset:
+                    selected.append({"type": record["type"], "data": record["data"]})
+                    available += 1
+                total += 1
 
-    return entries, total, truncated
+    return list(selected), total, truncated or available > len(selected)
